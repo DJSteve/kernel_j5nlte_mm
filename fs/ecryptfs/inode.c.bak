@@ -1533,6 +1533,19 @@ static int ecryptfs_removexattr(struct dentry *dentry, const char *name)
 		rc = -EOPNOTSUPP;
 		goto out;
 	}
+
+#ifdef CONFIG_DLP
+	if (!strcmp(name, KNOX_DLP_XATTR_NAME)) {
+#if DLP_DEBUG
+		printk(KERN_ERR "DLP %s: removing knox_dlp by [%d]\n", __func__, current_uid());
+#endif
+		if (!is_root() && !is_system_server()) {
+			printk(KERN_ERR "DLP %s: removing knox_dlp not allowed by [%d]\n", __func__, current_uid());
+			return -EPERM;
+		}
+	}
+#endif
+
 	mutex_lock(&lower_dentry->d_inode->i_mutex);
 	rc = lower_dentry->d_inode->i_op->removexattr(lower_dentry, name);
 	mutex_unlock(&lower_dentry->d_inode->i_mutex);
