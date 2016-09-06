@@ -1,0 +1,85 @@
+diff -Naur kernel.orig/fs/proc/base.c kernel/fs/proc/base.c
+--- kernel.orig/fs/proc/base.c	2014-06-18 20:15:45.000000000 +0200
++++ kernel/fs/proc/base.c	2014-11-01 18:14:29.000000000 +0100
+@@ -1020,7 +1020,7 @@
+ 
+ 	p = get_proc_task(inode);
+ 	if(p) {
+-		uid = task_uid(p);
++		uid = __kuid_val(task_uid(p));
+ 		put_task_struct(p);
+ 	}
+ 
+@@ -1028,7 +1028,7 @@
+ 	 * System Server (uid == 1000) is granted access to oom_adj of all 
+ 	 * android applications (uid > 10000) as and services (uid >= 1000)
+ 	 */
+-	if (p && (current_fsuid() == 1000) && (uid >= 1000)) {
++	if (p && (__kuid_val(current_fsuid()) == 1000) && (uid >= 1000)) {
+ 		if (inode->i_mode >> 6 & mask) {
+ 			return 0;
+ 		}
+diff -Naur kernel.orig/kernel/sched/core.c kernel/kernel/sched/core.c
+--- kernel.orig/kernel/sched/core.c	2014-06-18 20:15:45.000000000 +0200
++++ kernel/kernel/sched/core.c	2014-11-01 17:49:55.000000000 +0100
+@@ -7754,7 +7754,8 @@
+ 		tcred = __task_cred(task);
+ 
+ 		if ((current != task) && !capable(CAP_SYS_NICE) &&
+-		    cred->euid != tcred->uid && cred->euid != tcred->suid)
++//		    cred->euid != tcred->uid && cred->euid != tcred->suid)
++		    !uid_eq(cred->euid, tcred->uid) && !uid_eq(cred->euid, tcred->suid))
+ 			return -EACCES;
+ 	}
+ 
+diff -Naur kernel.orig/net/ipv4/tcp.c kernel/net/ipv4/tcp.c
+--- kernel.orig/net/ipv4/tcp.c	2014-06-18 20:15:46.000000000 +0200
++++ kernel/net/ipv4/tcp.c	2014-11-01 19:12:49.000000000 +0100
+@@ -1243,7 +1243,7 @@
+ 	release_sock(sk);
+ 
+ 	if (copied + copied_syn)
+-		uid_stat_tcp_snd(current_uid(), copied + copied_syn);
++		uid_stat_tcp_snd(__kuid_val(current_uid()), copied + copied_syn);
+ 	return copied + copied_syn;
+ 
+ do_fault:
+@@ -1548,7 +1548,7 @@
+ 	if (copied > 0) {
+ 		tcp_recv_skb(sk, seq, &offset);
+ 		tcp_cleanup_rbuf(sk, copied);
+-		uid_stat_tcp_rcv(current_uid(), copied);
++		uid_stat_tcp_rcv(__kuid_val(current_uid()), copied);
+ 	}
+ 	return copied;
+ }
+@@ -1955,7 +1955,7 @@
+ 	release_sock(sk);
+ 
+ 	if (copied > 0)
+-		uid_stat_tcp_rcv(current_uid(), copied);
++		uid_stat_tcp_rcv(__kuid_val(current_uid()), copied);
+ 	return copied;
+ 
+ out:
+@@ -1965,7 +1965,7 @@
+ recv_urg:
+ 	err = tcp_recv_urg(sk, msg, len, flags);
+ 	if (err > 0)
+-		uid_stat_tcp_rcv(current_uid(), err);
++		uid_stat_tcp_rcv(__kuid_val(current_uid()), err);
+ 	goto out;
+ 
+ recv_sndq:
+diff -Naur kernel.orig/net/netfilter/xt_quota2.c kernel/net/netfilter/xt_quota2.c
+--- kernel.orig/net/netfilter/xt_quota2.c	2014-06-18 20:15:46.000000000 +0200
++++ kernel/net/netfilter/xt_quota2.c	2014-11-01 19:35:32.000000000 +0100
+@@ -231,7 +231,7 @@
+ 		spin_unlock_bh(&counter_list_lock);
+ 		goto out;
+ 	}
+-	proc_set_user(p, quota_list_uid, quota_list_gid);
++	proc_set_user(p, make_kuid(&init_user_ns, quota_list_uid), make_kgid(&init_user_ns, quota_list_gid));
+ 	return e;
+ 
+  out:
