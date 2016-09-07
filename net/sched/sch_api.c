@@ -135,7 +135,7 @@ static DEFINE_RWLOCK(qdisc_mod_lock);
 
 static struct Qdisc_ops *qdisc_base;
 
-/* Register/uregister queueing discipline */
+/* Register/unregister queueing discipline */
 
 int register_qdisc(struct Qdisc_ops *qops)
 {
@@ -200,6 +200,58 @@ int unregister_qdisc(struct Qdisc_ops *qops)
 }
 EXPORT_SYMBOL(unregister_qdisc);
 
+/* Get default qdisc if not otherwise specified */
+void qdisc_get_default(char *name, size_t len)
+{
+	read_lock(&qdisc_mod_lock);
+	strlcpy(name, default_qdisc_ops->id, len);
+	read_unlock(&qdisc_mod_lock);
+}
+
+static struct Qdisc_ops *qdisc_lookup_default(const char *name)
+{
+	struct Qdisc_ops *q = NULL;
+
+	for (q = qdisc_base; q; q = q->next) {
+		if (!strcmp(name, q->id)) {
+			if (!try_module_get(q->owner))
+				q = NULL;
+			break;
+		}
+	}
+
+	return q;
+}
+
+/* Set new default qdisc to use */
+int qdisc_set_default(const char *name)
+{
+	const struct Qdisc_ops *ops;
+
+	if (!capable(CAP_NET_ADMIN))
+		return -EPERM;
+
+	write_lock(&qdisc_mod_lock);
+	ops = qdisc_lookup_default(name);
+	if (!ops) {
+		/* Not found, drop lock and try to load module */
+		write_unlock(&qdisc_mod_lock);
+		request_module("sch_%s", name);
+		write_lock(&qdisc_mod_lock);
+
+		ops = qdisc_lookup_default(name);
+	}
+
+	if (ops) {
+		/* Set new default */
+		module_put(default_qdisc_ops->owner);
+		default_qdisc_ops = ops;
+	}
+	write_unlock(&qdisc_mod_lock);
+
+	return ops ? 0 : -ENOENT;
+}
+
 /* We know handle. Find qdisc among all qdisc's attached to device
    (root qdisc, all its children, children of children etc.)
  */
@@ -219,11 +271,16 @@ static struct Qdisc *qdisc_match_from_root(struct Qdisc *root, u32 handle)
 	return NULL;
 }
 
-static void qdisc_list_add(struct Qdisc *q)
+void qdisc_list_add(struct Qdisc *q)
 {
-	if ((q->parent != TC_H_ROOT) && !(q->flags & TCQ_F_INGRESS))
-		list_add_tail(&q->list, &qdisc_dev(q)->qdisc->list);
+	if ((q->parent != TC_H_ROOT) && !(q->flags & TCQ_F_INGRESS)) {
+		struct Qdisc *root = qdisc_dev(q)->qdisc;
+
+		WARN_ON_ONCE(root == &noop_qdisc);
+		list_add_tail(&q->list, &root->list);
+	}
 }
+EXPORT_SYMBOL(qdisc_list_add);
 
 void qdisc_list_del(struct Qdisc *q)
 {
@@ -685,9 +742,11 @@ void qdisc_tree_decrease_qlen(struct Qdisc *sch, unsigned int n)
 	const struct Qdisc_class_ops *cops;
 	unsigned long cl;
 	u32 parentid;
+	int drops;
 
 	if (n == 0)
 		return;
+	drops = max_t(int, n, 0);
 	while ((parentid = sch->parent)) {
 		if (TC_H_MAJ(parentid) == TC_H_MAJ(TC_H_INGRESS))
 			return;
@@ -704,6 +763,7 @@ void qdisc_tree_decrease_qlen(struct Qdisc *sch, unsigned int n)
 			cops->put(sch, cl);
 		}
 		sch->q.qlen -= n;
+		sch->qstats.drops += drops;
 	}
 }
 EXPORT_SYMBOL(qdisc_tree_decrease_qlen);
@@ -752,10 +812,8 @@ static int qdisc_graft(struct net_device *dev, struct Qdisc *parent,
 		if (dev->flags & IFF_UP)
 			dev_deactivate(dev);
 
-		if (new && new->ops->attach) {
-			new->ops->attach(new);
-			num_q = 0;
-		}
+		if (new && new->ops->attach)
+			goto skip;
 
 		for (i = 0; i < num_q; i++) {
 			struct netdev_queue *dev_queue = dev_ingress_queue(dev);
@@ -771,12 +829,16 @@ static int qdisc_graft(struct net_device *dev, struct Qdisc *parent,
 				qdisc_destroy(old);
 		}
 
+skip:
 		if (!ingress) {
 			notify_and_destroy(net, skb, n, classid,
 					   dev->qdisc, new);
 			if (new && !new->ops->attach)
 				atomic_inc(&new->refcnt);
 			dev->qdisc = new ? : &noop_qdisc;
+
+			if (new && new->ops->attach)
+				new->ops->attach(new);
 		} else {
 			notify_and_destroy(net, skb, n, classid, old, new);
 		}
@@ -1024,7 +1086,7 @@ static int tc_get_qdisc(struct sk_buff *skb, struct nlmsghdr *n)
 	struct Qdisc *p = NULL;
 	int err;
 
-	if ((n->nlmsg_type != RTM_GETQDISC) && !capable(CAP_NET_ADMIN))
+	if ((n->nlmsg_type != RTM_GETQDISC) && !netlink_capable(skb, CAP_NET_ADMIN))
 		return -EPERM;
 
 	err = nlmsg_parse(n, sizeof(*tcm), tca, TCA_MAX, NULL);
@@ -1078,38 +1140,6 @@ static int tc_get_qdisc(struct sk_buff *skb, struct nlmsghdr *n)
 }
 
 /*
- * enable/disable flow on qdisc.
- */
-int
-tc_qdisc_flow_control(struct net_device *dev, u32 tcm_handle, int enable_flow)
-{
-	struct Qdisc *q;
-	int qdisc_len = 0;
-	struct __qdisc_change_req {
-		struct nlattr attr;
-		struct tc_prio_qopt data;
-	} req =	{
-		.attr = {sizeof(struct __qdisc_change_req), TCA_OPTIONS},
-		.data = {3, {1, 2, 2, 2, 1, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1}, 1}
-		};
-
-	/* override flow bit */
-	req.data.enable_flow = enable_flow;
-
-	/* look up using tcm handle */
-	q = qdisc_lookup(dev, tcm_handle);
-
-	/* call registered change function */
-	if (q) {
-		qdisc_len = q->q.qlen;
-		if (q->ops->change(q, &(req.attr)) != 0)
-			pr_err("tc_qdisc_flow_control: qdisc change failed");
-	}
-	return qdisc_len;
-}
-EXPORT_SYMBOL(tc_qdisc_flow_control);
-
-/*
  * Create/change qdisc.
  */
 
@@ -1123,7 +1153,7 @@ static int tc_modify_qdisc(struct sk_buff *skb, struct nlmsghdr *n)
 	struct Qdisc *q, *p;
 	int err;
 
-	if (!capable(CAP_NET_ADMIN))
+	if (!netlink_capable(skb, CAP_NET_ADMIN))
 		return -EPERM;
 
 replay:
@@ -1463,7 +1493,7 @@ static int tc_ctl_tclass(struct sk_buff *skb, struct nlmsghdr *n)
 	u32 qid;
 	int err;
 
-	if ((n->nlmsg_type != RTM_GETTCLASS) && !capable(CAP_NET_ADMIN))
+	if ((n->nlmsg_type != RTM_GETTCLASS) && !netlink_capable(skb, CAP_NET_ADMIN))
 		return -EPERM;
 
 	err = nlmsg_parse(n, sizeof(*tcm), tca, TCA_MAX, NULL);
@@ -1886,6 +1916,7 @@ static int __init pktsched_init(void)
 		return err;
 	}
 
+	register_qdisc(&pfifo_fast_ops);
 	register_qdisc(&pfifo_qdisc_ops);
 	register_qdisc(&bfifo_qdisc_ops);
 	register_qdisc(&pfifo_head_drop_qdisc_ops);

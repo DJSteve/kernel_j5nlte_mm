@@ -56,26 +56,13 @@
 #include <net/transp_v6.h>
 #include <net/ip6_route.h>
 #include <net/addrconf.h>
+#include <net/ndisc.h>
 #ifdef CONFIG_IPV6_TUNNEL
 #include <net/ip6_tunnel.h>
 #endif
 
 #include <asm/uaccess.h>
 #include <linux/mroute6.h>
-
-#ifdef CONFIG_ANDROID_PARANOID_NETWORK
-#include <linux/android_aid.h>
-
-static inline int current_has_network(void)
-{
-	return in_egroup_p(AID_INET) || capable(CAP_NET_RAW);
-}
-#else
-static inline int current_has_network(void)
-{
-	return 1;
-}
-#endif
 
 MODULE_AUTHOR("Cast of dozens");
 MODULE_DESCRIPTION("IPv6 protocol stack for Linux");
@@ -126,14 +113,6 @@ static int inet6_create(struct net *net, struct socket *sock, int protocol,
 	if (protocol < 0 || protocol >= IPPROTO_MAX)
 		return -EINVAL;
 
-	if (!current_has_network())
-		return -EACCES;
-
-	if (sock->type != SOCK_RAW &&
-	    sock->type != SOCK_DGRAM &&
-	    !inet_ehash_secret)
-		build_ehash_secret();
-
 	/* Look for the requested type/protocol pair. */
 lookup_protocol:
 	err = -ESOCKTNOSUPPORT;
@@ -180,7 +159,8 @@ lookup_protocol:
 	}
 
 	err = -EPERM;
-	if (sock->type == SOCK_RAW && !kern && !capable(CAP_NET_RAW))
+	if (sock->type == SOCK_RAW && !kern &&
+	    !ns_capable(net->user_ns, CAP_NET_RAW))
 		goto out_rcu_unlock;
 
 	sock->ops = answer->ops;
@@ -236,7 +216,7 @@ lookup_protocol:
 	inet->mc_list	= NULL;
 	inet->rcv_tos	= 0;
 
-	if (ipv4_config.no_pmtu_disc)
+	if (net->ipv4.sysctl_ip_no_pmtu_disc)
 		inet->pmtudisc = IP_PMTUDISC_DONT;
 	else
 		inet->pmtudisc = IP_PMTUDISC_WANT;
@@ -382,7 +362,7 @@ int inet6_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	inet->inet_rcv_saddr = v4addr;
 	inet->inet_saddr = v4addr;
 
-	np->rcv_saddr = addr->sin6_addr;
+	sk->sk_v6_rcv_saddr = addr->sin6_addr;
 
 	if (!(addr_type & IPV6_ADDR_MULTICAST))
 		np->saddr = addr->sin6_addr;
@@ -479,14 +459,14 @@ int inet6_getname(struct socket *sock, struct sockaddr *uaddr,
 		    peer == 1)
 			return -ENOTCONN;
 		sin->sin6_port = inet->inet_dport;
-		sin->sin6_addr = np->daddr;
+		sin->sin6_addr = sk->sk_v6_daddr;
 		if (np->sndflow)
 			sin->sin6_flowinfo = np->flow_label;
 	} else {
-		if (ipv6_addr_any(&np->rcv_saddr))
+		if (ipv6_addr_any(&sk->sk_v6_rcv_saddr))
 			sin->sin6_addr = np->saddr;
 		else
-			sin->sin6_addr = np->rcv_saddr;
+			sin->sin6_addr = sk->sk_v6_rcv_saddr;
 
 		sin->sin6_port = inet->inet_sport;
 	}
@@ -496,21 +476,6 @@ int inet6_getname(struct socket *sock, struct sockaddr *uaddr,
 	return 0;
 }
 EXPORT_SYMBOL(inet6_getname);
-
-int inet6_killaddr_ioctl(struct net *net, void __user *arg) {
-	struct in6_ifreq ireq;
-	struct sockaddr_in6 sin6;
-
-	if (!capable(CAP_NET_ADMIN))
-		return -EACCES;
-
-	if (copy_from_user(&ireq, arg, sizeof(struct in6_ifreq)))
-		return -EFAULT;
-
-	sin6.sin6_family = AF_INET6;
-	sin6.sin6_addr = ireq.ifr6_addr;
-	return tcp_nuke_addr(net, (struct sockaddr *) &sin6);
-}
 
 int inet6_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 {
@@ -535,8 +500,6 @@ int inet6_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 		return addrconf_del_ifaddr(net, (void __user *) arg);
 	case SIOCSIFDSTADDR:
 		return addrconf_set_dstaddr(net, (void __user *) arg);
-	case SIOCKILLADDR:
-		return inet6_killaddr_ioctl(net, (void __user *) arg);
 	default:
 		if (!sk->sk_prot->ioctl)
 			return -ENOIOCTLCMD;
@@ -690,19 +653,18 @@ int inet6_sk_rebuild_header(struct sock *sk)
 
 		memset(&fl6, 0, sizeof(fl6));
 		fl6.flowi6_proto = sk->sk_protocol;
-		fl6.daddr = np->daddr;
+		fl6.daddr = sk->sk_v6_daddr;
 		fl6.saddr = np->saddr;
 		fl6.flowlabel = np->flow_label;
 		fl6.flowi6_oif = sk->sk_bound_dev_if;
 		fl6.flowi6_mark = sk->sk_mark;
 		fl6.fl6_dport = inet->inet_dport;
 		fl6.fl6_sport = inet->inet_sport;
-		fl6.flowi6_uid = sock_i_uid(sk);
 		security_sk_classify_flow(sk, flowi6_to_flowi(&fl6));
 
 		final_p = fl6_update_dst(&fl6, np->opt, &final);
 
-		dst = ip6_dst_lookup_flow(sk, &fl6, final_p, false);
+		dst = ip6_dst_lookup_flow(sk, &fl6, final_p);
 		if (IS_ERR(dst)) {
 			sk->sk_route_caps = 0;
 			sk->sk_err_soft = -PTR_ERR(dst);
@@ -724,8 +686,7 @@ bool ipv6_opt_accepted(const struct sock *sk, const struct sk_buff *skb)
 	if (np->rxopt.all) {
 		if ((opt->hop && (np->rxopt.bits.hopopts ||
 				  np->rxopt.bits.ohopopts)) ||
-		    ((IPV6_FLOWINFO_MASK &
-		      *(__be32 *)skb_network_header(skb)) &&
+		    (ip6_flowinfo((struct ipv6hdr *) skb_network_header(skb)) &&
 		     np->rxopt.bits.rxflow) ||
 		    (opt->srcrt && (np->rxopt.bits.srcrt ||
 		     np->rxopt.bits.osrcrt)) ||
@@ -755,6 +716,8 @@ static void ipv6_packet_cleanup(void)
 
 static int __net_init ipv6_init_mibs(struct net *net)
 {
+	int i;
+
 	if (snmp_mib_init((void __percpu **)net->mib.udp_stats_in6,
 			  sizeof(struct udp_mib),
 			  __alignof__(struct udp_mib)) < 0)
@@ -767,6 +730,18 @@ static int __net_init ipv6_init_mibs(struct net *net)
 			  sizeof(struct ipstats_mib),
 			  __alignof__(struct ipstats_mib)) < 0)
 		goto err_ip_mib;
+
+	for_each_possible_cpu(i) {
+		struct ipstats_mib *af_inet6_stats;
+		af_inet6_stats = per_cpu_ptr(net->mib.ipv6_statistics[0], i);
+		u64_stats_init(&af_inet6_stats->syncp);
+#if SNMP_ARRAY_SZ == 2
+		af_inet6_stats = per_cpu_ptr(net->mib.ipv6_statistics[1], i);
+		u64_stats_init(&af_inet6_stats->syncp);
+#endif
+	}
+
+
 	if (snmp_mib_init((void __percpu **)net->mib.icmpv6_statistics,
 			  sizeof(struct icmpv6_mib),
 			  __alignof__(struct icmpv6_mib)) < 0)
@@ -803,6 +778,8 @@ static int __net_init inet6_net_init(struct net *net)
 
 	net->ipv6.sysctl.bindv6only = 0;
 	net->ipv6.sysctl.icmpv6_time = 1*HZ;
+	net->ipv6.sysctl.flowlabel_consistency = 1;
+	atomic_set(&net->ipv6.rt_genid, 0);
 
 	err = ipv6_init_mibs(net);
 	if (err)
@@ -844,6 +821,15 @@ static void __net_exit inet6_net_exit(struct net *net)
 static struct pernet_operations inet6_net_ops = {
 	.init = inet6_net_init,
 	.exit = inet6_net_exit,
+};
+
+static const struct ipv6_stub ipv6_stub_impl = {
+	.ipv6_sock_mc_join = ipv6_sock_mc_join,
+	.ipv6_sock_mc_drop = ipv6_sock_mc_drop,
+	.ipv6_dst_lookup = ip6_dst_lookup,
+	.udpv6_encap_enable = udpv6_encap_enable,
+	.ndisc_send_na = ndisc_send_na,
+	.nd_tbl	= &nd_tbl,
 };
 
 static int __init inet6_init(void)
@@ -896,8 +882,6 @@ static int __init inet6_init(void)
 	if (err)
 		goto out_sock_register_fail;
 
-	tcpv6_prot.sysctl_mem = init_net.ipv4.sysctl_tcp_mem;
-
 	/*
 	 *	ipngwg API draft makes clear that the correct semantics
 	 *	for TCP and UDP is to consider one TCP and UDP instance
@@ -920,6 +904,9 @@ static int __init inet6_init(void)
 	err = igmp6_init();
 	if (err)
 		goto igmp_fail;
+
+	ipv6_stub = &ipv6_stub_impl;
+
 	err = ipv6_netfilter_init();
 	if (err)
 		goto netfilter_fail;
@@ -938,6 +925,9 @@ static int __init inet6_init(void)
 	err = ip6_route_init();
 	if (err)
 		goto ip6_route_fail;
+	err = ndisc_late_init();
+	if (err)
+		goto ndisc_late_fail;
 	err = ip6_flowlabel_init();
 	if (err)
 		goto ip6_flowlabel_fail;
@@ -985,10 +975,10 @@ out:
 
 #ifdef CONFIG_SYSCTL
 sysctl_fail:
-	ipv6_packet_cleanup();
+	pingv6_exit();
 #endif
 pingv6_fail:
-	pingv6_exit();
+	ipv6_packet_cleanup();
 ipv6_packet_fail:
 	tcpv6_exit();
 tcpv6_fail:
@@ -1004,6 +994,8 @@ ipv6_exthdrs_fail:
 addrconf_fail:
 	ip6_flowlabel_cleanup();
 ip6_flowlabel_fail:
+	ndisc_late_cleanup();
+ndisc_late_fail:
 	ip6_route_cleanup();
 ip6_route_fail:
 #ifdef CONFIG_PROC_FS
@@ -1045,51 +1037,5 @@ out_unregister_tcp_proto:
 	goto out;
 }
 module_init(inet6_init);
-
-static void __exit inet6_exit(void)
-{
-	if (disable_ipv6_mod)
-		return;
-
-	/* First of all disallow new sockets creation. */
-	sock_unregister(PF_INET6);
-	/* Disallow any further netlink messages */
-	rtnl_unregister_all(PF_INET6);
-
-	udpv6_exit();
-	udplitev6_exit();
-	tcpv6_exit();
-
-	/* Cleanup code parts. */
-	ipv6_packet_cleanup();
-	ipv6_frag_exit();
-	ipv6_exthdrs_exit();
-	addrconf_cleanup();
-	ip6_flowlabel_cleanup();
-	ip6_route_cleanup();
-#ifdef CONFIG_PROC_FS
-
-	/* Cleanup code parts. */
-	if6_proc_exit();
-	ipv6_misc_proc_exit();
-	udplite6_proc_exit();
-	raw6_proc_exit();
-#endif
-	ipv6_netfilter_fini();
-	igmp6_cleanup();
-	ndisc_cleanup();
-	ip6_mr_cleanup();
-	icmpv6_cleanup();
-	rawv6_exit();
-
-	unregister_pernet_subsys(&inet6_net_ops);
-	proto_unregister(&rawv6_prot);
-	proto_unregister(&udplitev6_prot);
-	proto_unregister(&udpv6_prot);
-	proto_unregister(&tcpv6_prot);
-
-	rcu_barrier(); /* Wait for completion of call_rcu()'s */
-}
-module_exit(inet6_exit);
 
 MODULE_ALIAS_NETPROTO(PF_INET6);

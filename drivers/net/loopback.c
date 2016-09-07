@@ -59,6 +59,14 @@
 #include <net/net_namespace.h>
 #include <linux/u64_stats_sync.h>
 
+/*
+ * ifindex generation is per-net namespace, and loopback is
+ * always the 1st device in ns (see net_dev_init), thus any
+ * loopback device should get ifindex 1
+ */
+
+#define LOOPBACK_IFINDEX	1
+
 struct pcpu_lstats {
 	u64			packets;
 	u64			bytes;

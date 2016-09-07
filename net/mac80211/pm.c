@@ -37,9 +37,8 @@ int __ieee80211_suspend(struct ieee80211_hw *hw, struct cfg80211_wowlan *wowlan)
 					IEEE80211_MAX_QUEUE_MAP,
 					IEEE80211_QUEUE_STOP_REASON_SUSPEND);
 
-	/* flush out all packets and station cleanup call_rcu()s */
+	/* flush out all packets */
 	synchronize_net();
-	rcu_barrier();
 
 	ieee80211_flush_queues(local, NULL);
 
@@ -79,7 +78,7 @@ int __ieee80211_suspend(struct ieee80211_hw *hw, struct cfg80211_wowlan *wowlan)
 			return err;
 		} else if (err > 0) {
 			WARN_ON(err != 1);
-			local->wowlan = false;
+			return err;
 		} else {
 			goto suspend;
 		}

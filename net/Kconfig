@@ -5,6 +5,7 @@
 menuconfig NET
 	bool "Networking support"
 	select NLATTR
+	select GENERIC_NET_UTILS
 	---help---
 	  Unless you really know what you are doing, you should say Y here.
 	  The reason is that some programs need kernel networking support even
@@ -80,20 +81,6 @@ source "net/ipv6/Kconfig"
 source "net/netlabel/Kconfig"
 
 endif # if INET
-
-config ANDROID_PARANOID_NETWORK
-	bool "Only allow certain groups to create sockets"
-	default y
-	help
-		none
-
-config NET_ACTIVITY_STATS
-	bool "Network activity statistics tracking"
-	default y
-	help
-	 Network activity statistics are useful for tracking wireless
-	 modem activity on 2G, 3G, 4G wireless networks. Counts number of
-	 transmissions and groups them in specified time buckets.
 
 config NETWORK_SECMARK
 	bool "Security Marking"
@@ -232,7 +219,8 @@ source "net/batman-adv/Kconfig"
 source "net/openvswitch/Kconfig"
 source "net/vmw_vsock/Kconfig"
 source "net/netlink/Kconfig"
-source "net/rmnet_data/Kconfig"
+source "net/mpls/Kconfig"
+source "net/hsr/Kconfig"
 
 config RPS
 	boolean
@@ -250,12 +238,23 @@ config XPS
 	depends on SMP
 	default y
 
-config NETPRIO_CGROUP
+config CGROUP_NET_PRIO
 	tristate "Network priority cgroup"
 	depends on CGROUPS
 	---help---
 	  Cgroup subsystem for use in assigning processes to network priorities on
-	  a per-interface basis
+	  a per-interface basis.
+
+config CGROUP_NET_CLASSID
+	boolean "Network classid cgroup"
+	depends on CGROUPS
+	---help---
+	  Cgroup subsystem for use as general purpose socket classid marker that is
+	  being used in cls_cgroup and for netfilter matching.
+
+config NET_RX_BUSY_POLL
+	boolean
+	default y
 
 config BQL
 	boolean
@@ -274,20 +273,23 @@ config BPF_JIT
 	  packet sniffing (libpcap/tcpdump). Note : Admin should enable
 	  this feature changing /proc/sys/net/core/bpf_jit_enable
 
-config SOCKEV_NLMCAST
-	bool "Enable SOCKEV Netlink Multicast"
-	default n
+config NET_FLOW_LIMIT
+	boolean
+	depends on RPS
+	default y
 	---help---
-	  Default client for SOCKEV notifier events. Sends multicast netlink
-	  messages whenever the socket event notifier is invoked. Enable if
-	  user space entities need to be notified of socket events without
-	  having to poll /proc
+	  The network stack has to drop packets when a receive processing CPU's
+	  backlog reaches netdev_max_backlog. If a few out of many active flows
+	  generate the vast majority of load, drop their traffic earlier to
+	  maintain capacity for the other flows. This feature provides servers
+	  with many clients some protection against DoS by a single (spoofed)
+	  flow that greatly exceeds average workload.
 
 menu "Network testing"
 
 config NET_PKTGEN
 	tristate "Packet Generator (USE WITH CAUTION)"
-	depends on PROC_FS
+	depends on INET && PROC_FS
 	---help---
 	  This module will inject preconfigured packets, at a configurable
 	  rate, out of a given interface.  It is used for network interface
@@ -360,7 +362,6 @@ source "net/9p/Kconfig"
 source "net/caif/Kconfig"
 source "net/ceph/Kconfig"
 source "net/nfc/Kconfig"
-source "net/ipc_router/Kconfig"
 
 
 endif   # if NET

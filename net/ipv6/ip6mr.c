@@ -110,8 +110,8 @@ static struct kmem_cache *mrt_cachep __read_mostly;
 static struct mr6_table *ip6mr_new_table(struct net *net, u32 id);
 static void ip6mr_free_table(struct mr6_table *mrt);
 
-static int ip6_mr_forward(struct net *net, struct mr6_table *mrt,
-			  struct sk_buff *skb, struct mfc6_cache *cache);
+static void ip6_mr_forward(struct net *net, struct mr6_table *mrt,
+			   struct sk_buff *skb, struct mfc6_cache *cache);
 static int ip6mr_cache_report(struct mr6_table *mrt, struct sk_buff *pkt,
 			      mifi_t mifi, int assert);
 static int __ip6mr_fill_mroute(struct mr6_table *mrt, struct sk_buff *skb,
@@ -120,7 +120,7 @@ static void mr6_netlink_event(struct mr6_table *mrt, struct mfc6_cache *mfc,
 			      int cmd);
 static int ip6mr_rtm_dumproute(struct sk_buff *skb,
 			       struct netlink_callback *cb);
-static void mroute_clean_tables(struct mr6_table *mrt);
+static void mroute_clean_tables(struct mr6_table *mrt, bool all);
 static void ipmr_expire_process(unsigned long arg);
 
 #ifdef CONFIG_IPV6_MROUTE_MULTIPLE_TABLES
@@ -336,8 +336,8 @@ static struct mr6_table *ip6mr_new_table(struct net *net, u32 id)
 
 static void ip6mr_free_table(struct mr6_table *mrt)
 {
-	del_timer(&mrt->ipmr_expire_timer);
-	mroute_clean_tables(mrt);
+	del_timer_sync(&mrt->ipmr_expire_timer);
+	mroute_clean_tables(mrt, true);
 	kfree(mrt);
 }
 
@@ -552,7 +552,7 @@ static void ipmr_mfc_seq_stop(struct seq_file *seq, void *v)
 
 	if (it->cache == &mrt->mfc6_unres_queue)
 		spin_unlock_bh(&mfc_unres_lock);
-	else if (it->cache == mrt->mfc6_cache_array)
+	else if (it->cache == &mrt->mfc6_cache_array[it->ct])
 		read_unlock(&mrt_lock);
 }
 
@@ -675,9 +675,8 @@ static int pim6_rcv(struct sk_buff *skb)
 	skb_reset_network_header(skb);
 	skb->protocol = htons(ETH_P_IPV6);
 	skb->ip_summed = CHECKSUM_NONE;
-	skb->pkt_type = PACKET_HOST;
 
-	skb_tunnel_rx(skb, reg_dev);
+	skb_tunnel_rx(skb, reg_dev, dev_net(reg_dev));
 
 	netif_rx(skb);
 
@@ -701,7 +700,7 @@ static netdev_tx_t reg_vif_xmit(struct sk_buff *skb,
 	struct mr6_table *mrt;
 	struct flowi6 fl6 = {
 		.flowi6_oif	= dev->ifindex,
-		.flowi6_iif	= skb->skb_iif ? : LOOPBACK_IFINDEX,
+		.flowi6_iif	= skb->skb_iif,
 		.flowi6_mark	= skb->mark,
 	};
 	int err;
@@ -1077,6 +1076,7 @@ static struct mfc6_cache *ip6mr_cache_alloc(void)
 	struct mfc6_cache *c = kmem_cache_zalloc(mrt_cachep, GFP_KERNEL);
 	if (c == NULL)
 		return NULL;
+	c->mfc_un.res.last_assert = jiffies - MFC_ASSERT_THRESH - 1;
 	c->mfc_un.res.minvif = MAXMIFS;
 	return c;
 }
@@ -1327,7 +1327,7 @@ static int ip6mr_mfc_delete(struct mr6_table *mrt, struct mf6cctl *mfc,
 static int ip6mr_device_event(struct notifier_block *this,
 			      unsigned long event, void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct net *net = dev_net(dev);
 	struct mr6_table *mrt;
 	struct mif_device *v;
@@ -1537,7 +1537,7 @@ static int ip6mr_mfc_add(struct net *net, struct mr6_table *mrt,
  *	Close the multicast socket, and clear the vif tables etc
  */
 
-static void mroute_clean_tables(struct mr6_table *mrt)
+static void mroute_clean_tables(struct mr6_table *mrt, bool all)
 {
 	int i;
 	LIST_HEAD(list);
@@ -1547,8 +1547,9 @@ static void mroute_clean_tables(struct mr6_table *mrt)
 	 *	Shut down all active vif entries
 	 */
 	for (i = 0; i < mrt->maxvif; i++) {
-		if (!(mrt->vif6_table[i].flags & VIFF_STATIC))
-			mif6_delete(mrt, i, &list);
+		if (!all && (mrt->vif6_table[i].flags & VIFF_STATIC))
+			continue;
+		mif6_delete(mrt, i, &list);
 	}
 	unregister_netdevice_many(&list);
 
@@ -1557,7 +1558,7 @@ static void mroute_clean_tables(struct mr6_table *mrt)
 	 */
 	for (i = 0; i < MFC6_LINES; i++) {
 		list_for_each_entry_safe(c, next, &mrt->mfc6_cache_array[i], list) {
-			if (c->mfc_flags & MFC_STATIC)
+			if (!all && (c->mfc_flags & MFC_STATIC))
 				continue;
 			write_lock_bh(&mrt_lock);
 			list_del(&c->list);
@@ -1620,7 +1621,7 @@ int ip6mr_sk_done(struct sock *sk)
 						     net->ipv6.devconf_all);
 			write_unlock_bh(&mrt_lock);
 
-			mroute_clean_tables(mrt);
+			mroute_clean_tables(mrt, false);
 			err = 0;
 			break;
 		}
@@ -2077,8 +2078,8 @@ static int ip6mr_find_vif(struct mr6_table *mrt, struct net_device *dev)
 	return ct;
 }
 
-static int ip6_mr_forward(struct net *net, struct mr6_table *mrt,
-			  struct sk_buff *skb, struct mfc6_cache *cache)
+static void ip6_mr_forward(struct net *net, struct mr6_table *mrt,
+			   struct sk_buff *skb, struct mfc6_cache *cache)
 {
 	int psend = -1;
 	int vif, ct;
@@ -2159,12 +2160,11 @@ forward:
 last_forward:
 	if (psend != -1) {
 		ip6mr_forward2(net, mrt, skb, cache, psend);
-		return 0;
+		return;
 	}
 
 dont_forward:
 	kfree_skb(skb);
-	return 0;
 }
 
 

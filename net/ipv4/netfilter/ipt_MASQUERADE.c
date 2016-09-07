@@ -89,12 +89,7 @@ masquerade_tg(struct sk_buff *skb, const struct xt_action_param *par)
 	newrange.max_proto   = mr->range[0].max;
 
 	/* Hand modified range to generic setup. */
-#if defined(CONFIG_IP_NF_TARGET_NATTYPE_MODULE)
-	nf_nat_setup_info(ct, &newrange, NF_NAT_MANIP_SRC);
-	return XT_CONTINUE;
-#else
 	return nf_nat_setup_info(ct, &newrange, NF_NAT_MANIP_SRC);
-#endif
 }
 
 static int
@@ -113,7 +108,7 @@ static int masq_device_event(struct notifier_block *this,
 			     unsigned long event,
 			     void *ptr)
 {
-	const struct net_device *dev = ptr;
+	const struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct net *net = dev_net(dev);
 
 	if (event == NETDEV_DOWN) {
@@ -123,7 +118,7 @@ static int masq_device_event(struct notifier_block *this,
 		NF_CT_ASSERT(dev->ifindex != 0);
 
 		nf_ct_iterate_cleanup(net, device_cmp,
-				      (void *)(long)dev->ifindex);
+				      (void *)(long)dev->ifindex, 0, 0);
 	}
 
 	return NOTIFY_DONE;
@@ -134,7 +129,10 @@ static int masq_inet_event(struct notifier_block *this,
 			   void *ptr)
 {
 	struct net_device *dev = ((struct in_ifaddr *)ptr)->ifa_dev->dev;
-	return masq_device_event(this, event, dev);
+	struct netdev_notifier_info info;
+
+	netdev_notifier_info_init(&info, dev);
+	return masq_device_event(this, event, &info);
 }
 
 static struct notifier_block masq_dev_notifier = {
