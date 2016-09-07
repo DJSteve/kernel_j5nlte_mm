@@ -110,8 +110,6 @@ static inline void qdisc_run(struct Qdisc *q)
 }
 
 int tc_classify_compat(struct sk_buff *skb, const struct tcf_proto *tp,
-extern int tc_qdisc_flow_control(struct net_device *dev, u32 tcm_handle,
-				  int flow_enable);
 		       struct tcf_result *res);
 int tc_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 		struct tcf_result *res);
