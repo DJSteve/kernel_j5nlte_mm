@@ -1324,9 +1324,9 @@ int security_tun_dev_attach_queue(void *security)
 }
 EXPORT_SYMBOL(security_tun_dev_attach_queue);
 
-int security_tun_dev_attach(struct sock *sk, void *security)
+int security_tun_dev_attach(struct sock *sk)
 {
-	return security_ops->tun_dev_attach(sk, security);
+	return security_ops->tun_dev_attach(sk);
 }
 EXPORT_SYMBOL(security_tun_dev_attach);
 

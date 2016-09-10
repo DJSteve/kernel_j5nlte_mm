@@ -1137,7 +1137,7 @@ static int tun_set_iff(struct net *net, struct file *file, struct ifreq *ifr)
 
 		tun_sk(sk)->tun = tun;
 
-		security_tun_dev_post_create(sk);
+		//security_tun_dev_post_create(sk);
 
 		tun_net_init(dev);
 
