@@ -28,27 +28,32 @@
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
+#include <net/bluetooth/a2mp.h>
+#include <net/bluetooth/smp.h>
 
-#include "smp.h"
-#include "a2mp.h"
+static void hci_le_create_connection(struct hci_conn *conn)
+{
+	struct hci_dev *hdev = conn->hdev;
+	struct hci_cp_le_create_conn cp;
 
-struct sco_param {
-	u16 pkt_type;
-	u16 max_latency;
-};
+	conn->state = BT_CONNECT;
+	conn->out = true;
+	conn->link_mode |= HCI_LM_MASTER;
+	conn->sec_level = BT_SECURITY_LOW;
 
-static const struct sco_param sco_param_cvsd[] = {
-	{ EDR_ESCO_MASK & ~ESCO_2EV3, 0x000a }, /* S3 */
-	{ EDR_ESCO_MASK & ~ESCO_2EV3, 0x0007 }, /* S2 */
-	{ EDR_ESCO_MASK | ESCO_EV3,   0x0007 }, /* S1 */
-	{ EDR_ESCO_MASK | ESCO_HV3,   0xffff }, /* D1 */
-	{ EDR_ESCO_MASK | ESCO_HV1,   0xffff }, /* D0 */
-};
+	memset(&cp, 0, sizeof(cp));
+	cp.scan_interval = __constant_cpu_to_le16(0x0060);
+	cp.scan_window = __constant_cpu_to_le16(0x0030);
+	bacpy(&cp.peer_addr, &conn->dst);
+	cp.peer_addr_type = conn->dst_type;
+	cp.conn_interval_min = __constant_cpu_to_le16(0x0028);
+	cp.conn_interval_max = __constant_cpu_to_le16(0x0038);
+	cp.supervision_timeout = __constant_cpu_to_le16(0x002a);
+	cp.min_ce_len = __constant_cpu_to_le16(0x0000);
+	cp.max_ce_len = __constant_cpu_to_le16(0x0000);
 
-static const struct sco_param sco_param_wideband[] = {
-	{ EDR_ESCO_MASK & ~ESCO_2EV3, 0x000d }, /* T2 */
-	{ EDR_ESCO_MASK | ESCO_EV3,   0x0008 }, /* T1 */
-};
+	hci_send_cmd(hdev, HCI_OP_LE_CREATE_CONN, sizeof(cp), &cp);
+}
 
 static void hci_le_create_connection_cancel(struct hci_conn *conn)
 {
@@ -91,6 +96,8 @@ static void hci_acl_create_connection(struct hci_conn *conn)
 	}
 
 	cp.pkt_type = cpu_to_le16(conn->pkt_type);
+	/* Allow DUT to be MASTER for allow outgoing connection requests */
+	hdev->link_mode |= HCI_LM_MASTER;
 	if (lmp_rswitch_capable(hdev) && !(hdev->link_mode & HCI_LM_MASTER))
 		cp.role_switch = 0x01;
 	else
@@ -167,11 +174,10 @@ static void hci_add_sco(struct hci_conn *conn, __u16 handle)
 	hci_send_cmd(hdev, HCI_OP_ADD_SCO, sizeof(cp), &cp);
 }
 
-bool hci_setup_sync(struct hci_conn *conn, __u16 handle)
+void hci_setup_sync(struct hci_conn *conn, __u16 handle)
 {
 	struct hci_dev *hdev = conn->hdev;
 	struct hci_cp_setup_sync_conn cp;
-	const struct sco_param *param;
 
 	BT_DBG("hcon %p", conn);
 
@@ -181,35 +187,15 @@ bool hci_setup_sync(struct hci_conn *conn, __u16 handle)
 	conn->attempt++;
 
 	cp.handle   = cpu_to_le16(handle);
+	cp.pkt_type = cpu_to_le16(conn->pkt_type);
 
 	cp.tx_bandwidth   = __constant_cpu_to_le32(0x00001f40);
 	cp.rx_bandwidth   = __constant_cpu_to_le32(0x00001f40);
-	cp.voice_setting  = cpu_to_le16(conn->setting);
+	cp.max_latency    = __constant_cpu_to_le16(0xffff);
+	cp.voice_setting  = cpu_to_le16(hdev->voice_setting);
+	cp.retrans_effort = 0xff;
 
-	switch (conn->setting & SCO_AIRMODE_MASK) {
-	case SCO_AIRMODE_TRANSP:
-		if (conn->attempt > ARRAY_SIZE(sco_param_wideband))
-			return false;
-		cp.retrans_effort = 0x02;
-		param = &sco_param_wideband[conn->attempt - 1];
-		break;
-	case SCO_AIRMODE_CVSD:
-		if (conn->attempt > ARRAY_SIZE(sco_param_cvsd))
-			return false;
-		cp.retrans_effort = 0x01;
-		param = &sco_param_cvsd[conn->attempt - 1];
-		break;
-	default:
-		return false;
-	}
-
-	cp.pkt_type = __cpu_to_le16(param->pkt_type);
-	cp.max_latency = __cpu_to_le16(param->max_latency);
-
-	if (hci_send_cmd(hdev, HCI_OP_SETUP_SYNC_CONN, sizeof(cp), &cp) < 0)
-		return false;
-
-	return true;
+	hci_send_cmd(hdev, HCI_OP_SETUP_SYNC_CONN, sizeof(cp), &cp);
 }
 
 void hci_le_conn_update(struct hci_conn *conn, u16 min, u16 max,
@@ -317,15 +303,16 @@ static void hci_conn_timeout(struct work_struct *work)
 }
 
 /* Enter sniff mode */
-static void hci_conn_idle(struct work_struct *work)
+static void hci_conn_enter_sniff_mode(struct hci_conn *conn)
 {
-	struct hci_conn *conn = container_of(work, struct hci_conn,
-					     idle_work.work);
 	struct hci_dev *hdev = conn->hdev;
 
 	BT_DBG("hcon %p mode %d", conn, conn->mode);
 
 	if (test_bit(HCI_RAW, &hdev->flags))
+		return;
+
+	if (conn->type == LE_LINK)
 		return;
 
 	if (!lmp_sniff_capable(hdev) || !lmp_sniff_capable(conn))
@@ -354,16 +341,26 @@ static void hci_conn_idle(struct work_struct *work)
 	}
 }
 
-static void hci_conn_auto_accept(struct work_struct *work)
+static void hci_conn_idle(unsigned long arg)
 {
-	struct hci_conn *conn = container_of(work, struct hci_conn,
-					     auto_accept_work.work);
+	struct hci_conn *conn = (void *) arg;
 
-	hci_send_cmd(conn->hdev, HCI_OP_USER_CONFIRM_REPLY, sizeof(conn->dst),
+	BT_DBG("hcon %p mode %d", conn, conn->mode);
+
+	hci_conn_enter_sniff_mode(conn);
+}
+
+static void hci_conn_auto_accept(unsigned long arg)
+{
+	struct hci_conn *conn = (void *) arg;
+	struct hci_dev *hdev = conn->hdev;
+
+	hci_send_cmd(hdev, HCI_OP_USER_CONFIRM_REPLY, sizeof(conn->dst),
 		     &conn->dst);
 }
 
-struct hci_conn *hci_conn_add(struct hci_dev *hdev, int type, bdaddr_t *dst)
+struct hci_conn *hci_conn_add(struct hci_dev *hdev, int type,
+					__u16 pkt_type, bdaddr_t *dst)
 {
 	struct hci_conn *conn;
 
@@ -374,7 +371,6 @@ struct hci_conn *hci_conn_add(struct hci_dev *hdev, int type, bdaddr_t *dst)
 		return NULL;
 
 	bacpy(&conn->dst, dst);
-	bacpy(&conn->src, &hdev->bdaddr);
 	conn->hdev  = hdev;
 	conn->type  = type;
 	conn->mode  = HCI_CM_ACTIVE;
@@ -392,14 +388,22 @@ struct hci_conn *hci_conn_add(struct hci_dev *hdev, int type, bdaddr_t *dst)
 		conn->pkt_type = hdev->pkt_type & ACL_PTYPE_MASK;
 		break;
 	case SCO_LINK:
-		if (lmp_esco_capable(hdev))
-			conn->pkt_type = (hdev->esco_type & SCO_ESCO_MASK) |
-					(hdev->esco_type & EDR_ESCO_MASK);
-		else
-			conn->pkt_type = hdev->pkt_type & SCO_PTYPE_MASK;
-		break;
+		if (!pkt_type)
+			pkt_type = SCO_ESCO_MASK;
 	case ESCO_LINK:
-		conn->pkt_type = hdev->esco_type & ~EDR_ESCO_MASK;
+		if (!pkt_type)
+			pkt_type = ALL_ESCO_MASK;
+		if (lmp_esco_capable(hdev)) {
+			/* HCI Setup Synchronous Connection Command uses
+			   reverse logic on the EDR_ESCO_MASK bits */
+			conn->pkt_type = (pkt_type ^ EDR_ESCO_MASK) &
+					hdev->esco_type;
+		} else {
+			/* Legacy HCI Add Sco Connection Command uses a
+			   shifted bitmask */
+			conn->pkt_type = (pkt_type << 5) & hdev->pkt_type &
+					SCO_PTYPE_MASK;
+		}
 		break;
 	}
 
@@ -408,8 +412,9 @@ struct hci_conn *hci_conn_add(struct hci_dev *hdev, int type, bdaddr_t *dst)
 	INIT_LIST_HEAD(&conn->chan_list);
 
 	INIT_DELAYED_WORK(&conn->disc_work, hci_conn_timeout);
-	INIT_DELAYED_WORK(&conn->auto_accept_work, hci_conn_auto_accept);
-	INIT_DELAYED_WORK(&conn->idle_work, hci_conn_idle);
+	setup_timer(&conn->idle_timer, hci_conn_idle, (unsigned long)conn);
+	setup_timer(&conn->auto_accept_timer, hci_conn_auto_accept,
+		    (unsigned long) conn);
 
 	atomic_set(&conn->refcnt, 0);
 
@@ -430,9 +435,11 @@ int hci_conn_del(struct hci_conn *conn)
 
 	BT_DBG("%s hcon %p handle %d", hdev->name, conn, conn->handle);
 
+	del_timer(&conn->idle_timer);
+
 	cancel_delayed_work_sync(&conn->disc_work);
-	cancel_delayed_work_sync(&conn->auto_accept_work);
-	cancel_delayed_work_sync(&conn->idle_work);
+
+	del_timer(&conn->auto_accept_timer);
 
 	if (conn->type == ACL_LINK) {
 		struct hci_conn *sco = conn->link;
@@ -486,7 +493,6 @@ struct hci_dev *hci_get_route(bdaddr_t *dst, bdaddr_t *src)
 	list_for_each_entry(d, &hci_dev_list, list) {
 		if (!test_bit(HCI_UP, &d->flags) ||
 		    test_bit(HCI_RAW, &d->flags) ||
-		    test_bit(HCI_USER_CHANNEL, &d->dev_flags) ||
 		    d->dev_type != HCI_BREDR)
 			continue;
 
@@ -514,124 +520,34 @@ struct hci_dev *hci_get_route(bdaddr_t *dst, bdaddr_t *src)
 }
 EXPORT_SYMBOL(hci_get_route);
 
-static void create_le_conn_complete(struct hci_dev *hdev, u8 status)
-{
-	struct hci_conn *conn;
-
-	if (status == 0)
-		return;
-
-	BT_ERR("HCI request failed to create LE connection: status 0x%2.2x",
-	       status);
-
-	hci_dev_lock(hdev);
-
-	conn = hci_conn_hash_lookup_state(hdev, LE_LINK, BT_CONNECT);
-	if (!conn)
-		goto done;
-
-	conn->state = BT_CLOSED;
-
-	mgmt_connect_failed(hdev, &conn->dst, conn->type, conn->dst_type,
-			    status);
-
-	hci_proto_connect_cfm(conn, status);
-
-	hci_conn_del(conn);
-
-done:
-	hci_dev_unlock(hdev);
-}
-
-static int hci_create_le_conn(struct hci_conn *conn)
-{
-	struct hci_dev *hdev = conn->hdev;
-	struct hci_cp_le_create_conn cp;
-	struct hci_request req;
-	int err;
-
-	hci_req_init(&req, hdev);
-
-	memset(&cp, 0, sizeof(cp));
-	cp.scan_interval = cpu_to_le16(hdev->le_scan_interval);
-	cp.scan_window = cpu_to_le16(hdev->le_scan_window);
-	bacpy(&cp.peer_addr, &conn->dst);
-	cp.peer_addr_type = conn->dst_type;
-	cp.own_address_type = conn->src_type;
-	cp.conn_interval_min = cpu_to_le16(hdev->le_conn_min_interval);
-	cp.conn_interval_max = cpu_to_le16(hdev->le_conn_max_interval);
-	cp.supervision_timeout = __constant_cpu_to_le16(0x002a);
-	cp.min_ce_len = __constant_cpu_to_le16(0x0000);
-	cp.max_ce_len = __constant_cpu_to_le16(0x0000);
-
-	hci_req_add(&req, HCI_OP_LE_CREATE_CONN, sizeof(cp), &cp);
-
-	err = hci_req_run(&req, create_le_conn_complete);
-	if (err) {
-		hci_conn_del(conn);
-		return err;
-	}
-
-	return 0;
-}
-
 static struct hci_conn *hci_connect_le(struct hci_dev *hdev, bdaddr_t *dst,
 				    u8 dst_type, u8 sec_level, u8 auth_type)
 {
-	struct hci_conn *conn;
-	int err;
+	struct hci_conn *le;
 
-	if (test_bit(HCI_ADVERTISING, &hdev->flags))
+	if (test_bit(HCI_LE_PERIPHERAL, &hdev->flags))
 		return ERR_PTR(-ENOTSUPP);
 
-	/* Some devices send ATT messages as soon as the physical link is
-	 * established. To be able to handle these ATT messages, the user-
-	 * space first establishes the connection and then starts the pairing
-	 * process.
-	 *
-	 * So if a hci_conn object already exists for the following connection
-	 * attempt, we simply update pending_sec_level and auth_type fields
-	 * and return the object found.
-	 */
-	conn = hci_conn_hash_lookup_ba(hdev, LE_LINK, dst);
-	if (conn) {
-		conn->pending_sec_level = sec_level;
-		conn->auth_type = auth_type;
-		goto done;
+	le = hci_conn_hash_lookup_ba(hdev, LE_LINK, dst);
+	if (!le) {
+		le = hci_conn_hash_lookup_state(hdev, LE_LINK, BT_CONNECT);
+		if (le)
+			return ERR_PTR(-EBUSY);
+
+		le = hci_conn_add(hdev, LE_LINK, 0, dst);
+		if (!le)
+			return ERR_PTR(-ENOMEM);
+
+		le->dst_type = bdaddr_to_le(dst_type);
+		hci_le_create_connection(le);
 	}
 
-	/* Since the controller supports only one LE connection attempt at a
-	 * time, we return -EBUSY if there is any connection attempt running.
-	 */
-	conn = hci_conn_hash_lookup_state(hdev, LE_LINK, BT_CONNECT);
-	if (conn)
-		return ERR_PTR(-EBUSY);
+	le->pending_sec_level = sec_level;
+	le->auth_type = auth_type;
 
-	conn = hci_conn_add(hdev, LE_LINK, dst);
-	if (!conn)
-		return ERR_PTR(-ENOMEM);
+	hci_conn_hold(le);
 
-	if (dst_type == BDADDR_LE_PUBLIC)
-		conn->dst_type = ADDR_LE_DEV_PUBLIC;
-	else
-		conn->dst_type = ADDR_LE_DEV_RANDOM;
-
-	conn->src_type = hdev->own_addr_type;
-
-	conn->state = BT_CONNECT;
-	conn->out = true;
-	conn->link_mode |= HCI_LM_MASTER;
-	conn->sec_level = BT_SECURITY_LOW;
-	conn->pending_sec_level = sec_level;
-	conn->auth_type = auth_type;
-
-	err = hci_create_le_conn(conn);
-	if (err)
-		return ERR_PTR(err);
-
-done:
-	hci_conn_hold(conn);
-	return conn;
+	return le;
 }
 
 static struct hci_conn *hci_connect_acl(struct hci_dev *hdev, bdaddr_t *dst,
@@ -639,12 +555,9 @@ static struct hci_conn *hci_connect_acl(struct hci_dev *hdev, bdaddr_t *dst,
 {
 	struct hci_conn *acl;
 
-	if (!test_bit(HCI_BREDR_ENABLED, &hdev->dev_flags))
-		return ERR_PTR(-ENOTSUPP);
-
 	acl = hci_conn_hash_lookup_ba(hdev, ACL_LINK, dst);
 	if (!acl) {
-		acl = hci_conn_add(hdev, ACL_LINK, dst);
+		acl = hci_conn_add(hdev, ACL_LINK, 0, dst);
 		if (!acl)
 			return ERR_PTR(-ENOMEM);
 	}
@@ -661,19 +574,31 @@ static struct hci_conn *hci_connect_acl(struct hci_dev *hdev, bdaddr_t *dst,
 	return acl;
 }
 
-struct hci_conn *hci_connect_sco(struct hci_dev *hdev, int type, bdaddr_t *dst,
-				 __u16 setting)
+static struct hci_conn *hci_connect_sco(struct hci_dev *hdev, int type,
+					__u16 pkt_type, bdaddr_t *dst,
+					u8 sec_level, u8 auth_type)
 {
 	struct hci_conn *acl;
 	struct hci_conn *sco;
 
-	acl = hci_connect_acl(hdev, dst, BT_SECURITY_LOW, HCI_AT_NO_BONDING);
+	acl = hci_connect_acl(hdev, dst, sec_level, auth_type);
 	if (IS_ERR(acl))
 		return acl;
 
+	/* type of connection already existing can be ESCO or SCO
+	 * so check for both types before creating new */
+
 	sco = hci_conn_hash_lookup_ba(hdev, type, dst);
+
+	if (!sco && type == ESCO_LINK) {
+		sco = hci_conn_hash_lookup_ba(hdev, SCO_LINK, dst);
+	} else if (!sco && type == SCO_LINK) {
+		/* this case can be practically not possible */
+		sco = hci_conn_hash_lookup_ba(hdev, ESCO_LINK, dst);
+	}
+
 	if (!sco) {
-		sco = hci_conn_add(hdev, type, dst);
+		sco = hci_conn_add(hdev, type, pkt_type, dst);
 		if (!sco) {
 			hci_conn_drop(acl);
 			return ERR_PTR(-ENOMEM);
@@ -684,8 +609,6 @@ struct hci_conn *hci_connect_sco(struct hci_dev *hdev, int type, bdaddr_t *dst,
 	sco->link = acl;
 
 	hci_conn_hold(sco);
-
-	sco->setting = setting;
 
 	if (acl->state == BT_CONNECTED &&
 	    (sco->state == BT_OPEN || sco->state == BT_CLOSED)) {
@@ -705,7 +628,8 @@ struct hci_conn *hci_connect_sco(struct hci_dev *hdev, int type, bdaddr_t *dst,
 }
 
 /* Create SCO, ACL or LE connection. */
-struct hci_conn *hci_connect(struct hci_dev *hdev, int type, bdaddr_t *dst,
+struct hci_conn *hci_connect(struct hci_dev *hdev, int type,
+			     __u16 pkt_type, bdaddr_t *dst,
 			     __u8 dst_type, __u8 sec_level, __u8 auth_type)
 {
 	BT_DBG("%s dst %pMR type 0x%x", hdev->name, dst, type);
@@ -715,6 +639,9 @@ struct hci_conn *hci_connect(struct hci_dev *hdev, int type, bdaddr_t *dst,
 		return hci_connect_le(hdev, dst, dst_type, sec_level, auth_type);
 	case ACL_LINK:
 		return hci_connect_acl(hdev, dst, sec_level, auth_type);
+	case SCO_LINK:
+	case ESCO_LINK:
+		return hci_connect_sco(hdev, type, pkt_type, dst, sec_level, auth_type);
 	}
 
 	return ERR_PTR(-EINVAL);
@@ -887,6 +814,24 @@ int hci_conn_switch_role(struct hci_conn *conn, __u8 role)
 }
 EXPORT_SYMBOL(hci_conn_switch_role);
 
+/* Change ACL link policy */
+int hci_cfg_link_policy(struct hci_conn *conn)
+{
+	struct hci_cp_write_link_policy lp;
+
+	if (conn == NULL) {
+		BT_ERR("%s: NO HCI Connection handle available!", __func__);
+		return -ENODEV;
+	}
+	BT_INFO("%s: Disabling role switch on the ACL handle %d",
+		__func__, conn->handle);
+	lp.handle = conn->handle;
+	lp.policy = HCI_LP_HOLD|HCI_LP_SNIFF|HCI_LP_PARK;
+	hci_send_cmd(conn->hdev, HCI_OP_WRITE_LINK_POLICY, sizeof(lp), &lp);
+	return 0;
+}
+EXPORT_SYMBOL(hci_cfg_link_policy);
+
 /* Enter active mode */
 void hci_conn_enter_active_mode(struct hci_conn *conn, __u8 force_active)
 {
@@ -895,6 +840,9 @@ void hci_conn_enter_active_mode(struct hci_conn *conn, __u8 force_active)
 	BT_DBG("hcon %p mode %d", conn, conn->mode);
 
 	if (test_bit(HCI_RAW, &hdev->flags))
+		return;
+
+	if (conn->type == LE_LINK)
 		return;
 
 	if (conn->mode != HCI_CM_SNIFF)
@@ -911,8 +859,8 @@ void hci_conn_enter_active_mode(struct hci_conn *conn, __u8 force_active)
 
 timer:
 	if (hdev->idle_timeout > 0)
-		queue_delayed_work(hdev->workqueue, &conn->idle_work,
-				   msecs_to_jiffies(hdev->idle_timeout));
+		mod_timer(&conn->idle_timer,
+			  jiffies + msecs_to_jiffies(hdev->idle_timeout));
 }
 
 /* Drop all connection on the device */
@@ -983,6 +931,15 @@ int hci_get_conn_list(void __user *arg)
 		(ci + n)->out   = c->out;
 		(ci + n)->state = c->state;
 		(ci + n)->link_mode = c->link_mode;
+		if (c->type == SCO_LINK) {
+			(ci + n)->mtu = hdev->sco_mtu;
+			(ci + n)->cnt = hdev->sco_cnt;
+			(ci + n)->pkts = hdev->sco_pkts;
+		} else {
+			(ci + n)->mtu = hdev->acl_mtu;
+			(ci + n)->cnt = hdev->acl_cnt;
+			(ci + n)->pkts = hdev->acl_pkts;
+		}
 		if (++n >= req.conn_num)
 			break;
 	}
@@ -1019,6 +976,15 @@ int hci_get_conn_info(struct hci_dev *hdev, void __user *arg)
 		ci.out   = conn->out;
 		ci.state = conn->state;
 		ci.link_mode = conn->link_mode;
+		if (req.type == SCO_LINK) {
+			ci.mtu = hdev->sco_mtu;
+			ci.cnt = hdev->sco_cnt;
+			ci.pkts = hdev->sco_pkts;
+		} else {
+			ci.mtu = hdev->acl_mtu;
+			ci.cnt = hdev->acl_cnt;
+			ci.pkts = hdev->acl_pkts;
+		}
 	}
 	hci_dev_unlock(hdev);
 
