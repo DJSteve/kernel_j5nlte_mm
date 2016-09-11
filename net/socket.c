@@ -450,17 +450,16 @@ EXPORT_SYMBOL(sockfd_lookup);
 
 static struct socket *sockfd_lookup_light(int fd, int *err, int *fput_needed)
 {
-	struct fd f = fdget(fd);
+	struct file *file;
 	struct socket *sock;
 
 	*err = -EBADF;
-	if (f.file) {
-		sock = sock_from_file(f.file, err);
-		if (likely(sock)) {
-			*fput_needed = f.flags;
+	file = fget_light(fd, fput_needed);
+	if (file) {
+		sock = sock_from_file(file, err);
+		if (sock)
 			return sock;
-		}
-		fdput(f);
+		fput_light(file, *fput_needed);
 	}
 	return NULL;
 }
@@ -1138,7 +1137,6 @@ EXPORT_SYMBOL(sock_create_lite);
 /* No kernel lock held - perfect */
 static unsigned int sock_poll(struct file *file, poll_table *wait)
 {
-	unsigned int busy_flag = 0;
 	struct socket *sock;
 
 	/*
@@ -1146,16 +1144,7 @@ static unsigned int sock_poll(struct file *file, poll_table *wait)
 	 */
 	sock = file->private_data;
 
-	if (sk_can_busy_loop(sock->sk)) {
-		/* this socket can poll_ll so tell the system call */
-		busy_flag = POLL_BUSY_LOOP;
-
-		/* once, only if requested by syscall */
-		if (wait && (wait->_key & POLL_BUSY_LOOP))
-			sk_busy_loop(sock->sk, 1);
-	}
-
-	return busy_flag | sock->ops->poll(file, sock, wait);
+	return sock->ops->poll(file, sock, wait);
 }
 
 static int sock_mmap(struct file *file, struct vm_area_struct *vma)
@@ -2674,9 +2663,7 @@ static int __init sock_init(void)
 	 */
 
 #ifdef CONFIG_NETFILTER
-	err = netfilter_init();
-	if (err)
-		goto out;
+	netfilter_init();
 #endif
 
 #ifdef CONFIG_NETWORK_PHY_TIMESTAMPING
