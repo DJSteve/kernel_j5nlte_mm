@@ -1210,12 +1210,8 @@ EXPORT_SYMBOL(netdev_features_change);
 void netdev_state_change(struct net_device *dev)
 {
 	if (dev->flags & IFF_UP) {
-		struct netdev_notifier_change_info change_info;
-
-		change_info.flags_changed = 0;
-		call_netdevice_notifiers_info(NETDEV_CHANGE, dev,
-					      &change_info.info);
-		rtmsg_ifinfo(RTM_NEWLINK, dev, 0, GFP_KERNEL);
+		call_netdevice_notifiers(NETDEV_CHANGE, dev);
+		rtmsg_ifinfo(RTM_NEWLINK, dev, 0);
 	}
 }
 EXPORT_SYMBOL(netdev_state_change);
@@ -1305,7 +1301,7 @@ int dev_open(struct net_device *dev)
 	if (ret < 0)
 		return ret;
 
-	rtmsg_ifinfo(RTM_NEWLINK, dev, IFF_UP|IFF_RUNNING, GFP_KERNEL);
+	rtmsg_ifinfo(RTM_NEWLINK, dev, IFF_UP|IFF_RUNNING);
 	call_netdevice_notifiers(NETDEV_UP, dev);
 
 	return ret;
@@ -1383,7 +1379,7 @@ static int dev_close_many(struct list_head *head)
 	__dev_close_many(head);
 
 	list_for_each_entry_safe(dev, tmp, head, close_list) {
-		rtmsg_ifinfo(RTM_NEWLINK, dev, IFF_UP|IFF_RUNNING, GFP_KERNEL);
+		rtmsg_ifinfo(RTM_NEWLINK, dev, IFF_UP|IFF_RUNNING);
 		call_netdevice_notifiers(NETDEV_DOWN, dev);
 		list_del_init(&dev->close_list);
 	}
@@ -1435,10 +1431,6 @@ void dev_disable_lro(struct net_device *dev)
 	 */
 	if (is_vlan_dev(dev))
 		dev = vlan_dev_real_dev(dev);
-
-	/* the same for macvlan devices */
-	if (netif_is_macvlan(dev))
-		dev = macvlan_dev_real_dev(dev);
 
 	dev->wanted_features &= ~NETIF_F_LRO;
 	netdev_update_features(dev);
@@ -2619,7 +2611,6 @@ int dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev,
 			dev_queue_xmit_nit(skb, dev);
 
 		skb_len = skb->len;
-		trace_net_dev_start_xmit(skb, dev);
 		rc = ops->ndo_start_xmit(skb, dev);
 		trace_net_dev_xmit(skb, rc, dev, skb_len);
 		if (rc == NETDEV_TX_OK)
@@ -2638,7 +2629,6 @@ gso:
 			dev_queue_xmit_nit(nskb, dev);
 
 		skb_len = nskb->len;
-		trace_net_dev_start_xmit(nskb, dev);
 		rc = ops->ndo_start_xmit(nskb, dev);
 		trace_net_dev_xmit(nskb, rc, dev, skb_len);
 		if (unlikely(rc != NETDEV_TX_OK)) {
@@ -3302,9 +3292,39 @@ static int netif_rx_internal(struct sk_buff *skb)
 
 int netif_rx(struct sk_buff *skb)
 {
-	trace_netif_rx_entry(skb);
+	int ret;
 
-	return netif_rx_internal(skb);
+	/* if netpoll wants it, pretend we never saw it */
+	if (netpoll_rx(skb))
+		return NET_RX_DROP;
+
+	net_timestamp_check(netdev_tstamp_prequeue, skb);
+
+	trace_netif_rx(skb);
+#ifdef CONFIG_RPS
+	if (static_key_false(&rps_needed)) {
+		struct rps_dev_flow voidflow, *rflow = &voidflow;
+		int cpu;
+
+		preempt_disable();
+		rcu_read_lock();
+
+		cpu = get_rps_cpu(skb->dev, skb, &rflow);
+		if (cpu < 0)
+			cpu = smp_processor_id();
+
+		ret = enqueue_to_backlog(skb, cpu, &rflow->last_qtail);
+
+		rcu_read_unlock();
+		preempt_enable();
+	} else
+#endif
+	{
+		unsigned int qtail;
+		ret = enqueue_to_backlog(skb, get_cpu(), &qtail);
+		put_cpu();
+	}
+	return ret;
 }
 EXPORT_SYMBOL(netif_rx);
 
@@ -3312,10 +3332,8 @@ int netif_rx_ni(struct sk_buff *skb)
 {
 	int err;
 
-	trace_netif_rx_ni_entry(skb);
-
 	preempt_disable();
-	err = netif_rx_internal(skb);
+	err = netif_rx(skb);
 	if (local_softirq_pending())
 		do_softirq();
 	preempt_enable();
@@ -3741,9 +3759,29 @@ static int netif_receive_skb_internal(struct sk_buff *skb)
  */
 int netif_receive_skb(struct sk_buff *skb)
 {
-	trace_netif_receive_skb_entry(skb);
+	net_timestamp_check(netdev_tstamp_prequeue, skb);
 
-	return netif_receive_skb_internal(skb);
+	if (skb_defer_rx_timestamp(skb))
+		return NET_RX_SUCCESS;
+
+#ifdef CONFIG_RPS
+	if (static_key_false(&rps_needed)) {
+		struct rps_dev_flow voidflow, *rflow = &voidflow;
+		int cpu, ret;
+
+		rcu_read_lock();
+
+		cpu = get_rps_cpu(skb->dev, skb, &rflow);
+
+		if (cpu >= 0) {
+			ret = enqueue_to_backlog(skb, cpu, &rflow->last_qtail);
+			rcu_read_unlock();
+			return ret;
+		}
+		rcu_read_unlock();
+	}
+#endif
+	return __netif_receive_skb(skb);
 }
 EXPORT_SYMBOL(netif_receive_skb);
 
@@ -4050,7 +4088,7 @@ static gro_result_t napi_skb_finish(gro_result_t ret, struct sk_buff *skb)
 
 gro_result_t napi_gro_receive(struct napi_struct *napi, struct sk_buff *skb)
 {
-	trace_napi_gro_receive_entry(skb);
+	skb_gro_reset_offset(skb);
 
 	return napi_skb_finish(dev_gro_receive(napi, skb), skb);
 }
@@ -4126,8 +4164,6 @@ gro_result_t napi_gro_frags(struct napi_struct *napi)
 
 	if (!skb)
 		return GRO_DROP;
-
-	trace_napi_gro_frags_entry(skb);
 
 	return napi_frags_finish(napi, skb, dev_gro_receive(napi, skb));
 }
@@ -4552,8 +4588,6 @@ struct net_device *netdev_all_upper_get_next_dev_rcu(struct net_device *dev,
 						     struct list_head **iter)
 {
 	struct netdev_adjacent *upper;
-
-	WARN_ON_ONCE(!rcu_read_lock_held() && !lockdep_rtnl_is_held());
 
 	upper = list_entry_rcu((*iter)->next, struct netdev_adjacent, list);
 
@@ -5459,7 +5493,7 @@ void __dev_notify_flags(struct net_device *dev, unsigned int old_flags,
 	unsigned int changes = dev->flags ^ old_flags;
 
 	if (gchanges)
-		rtmsg_ifinfo(RTM_NEWLINK, dev, gchanges, GFP_ATOMIC);
+		rtmsg_ifinfo(RTM_NEWLINK, dev, gchanges);
 
 	if (changes & IFF_UP) {
 		if (dev->flags & IFF_UP)
@@ -5713,7 +5747,7 @@ static void rollback_registered_many(struct list_head *head)
 
 		if (!dev->rtnl_link_ops ||
 		    dev->rtnl_link_state == RTNL_LINK_INITIALIZED)
-			rtmsg_ifinfo(RTM_DELLINK, dev, ~0U, GFP_KERNEL);
+			rtmsg_ifinfo(RTM_DELLINK, dev, ~0U);
 
 		/*
 		 *	Flush the unicast and multicast chains
@@ -6108,7 +6142,7 @@ int register_netdevice(struct net_device *dev)
 	 */
 	if (!dev->rtnl_link_ops ||
 	    dev->rtnl_link_state == RTNL_LINK_INITIALIZED)
-		rtmsg_ifinfo(RTM_NEWLINK, dev, ~0U, GFP_KERNEL);
+		rtmsg_ifinfo(RTM_NEWLINK, dev, ~0U);
 
 out:
 	return ret;
@@ -6734,7 +6768,7 @@ int dev_change_net_namespace(struct net_device *dev, struct net *net, const char
 	call_netdevice_notifiers(NETDEV_UNREGISTER, dev);
 	rcu_barrier();
 	call_netdevice_notifiers(NETDEV_UNREGISTER_FINAL, dev);
-	rtmsg_ifinfo(RTM_DELLINK, dev, ~0U, GFP_KERNEL);
+	rtmsg_ifinfo(RTM_DELLINK, dev, ~0U);
 
 	/*
 	 *	Flush the unicast and multicast chains
@@ -6775,7 +6809,7 @@ int dev_change_net_namespace(struct net_device *dev, struct net *net, const char
 	 *	Prevent userspace races by waiting until the network
 	 *	device is fully setup before sending notifications.
 	 */
-	rtmsg_ifinfo(RTM_NEWLINK, dev, ~0U, GFP_KERNEL);
+	rtmsg_ifinfo(RTM_NEWLINK, dev, ~0U);
 
 	synchronize_net();
 	err = 0;

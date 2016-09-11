@@ -1650,7 +1650,7 @@ struct security_operations {
 	void (*tun_dev_free_security) (void *security);
 	int (*tun_dev_create) (void);
 	int (*tun_dev_attach_queue) (void *security);
-	int (*tun_dev_attach) (struct sock *sk, void *security);
+	int (*tun_dev_attach) (struct sock *sk);
 	int (*tun_dev_open) (void *security);
 	void (*skb_owned_by) (struct sk_buff *skb, struct sock *sk);
 #endif	/* CONFIG_SECURITY_NETWORK */
@@ -2648,7 +2648,7 @@ int security_tun_dev_alloc_security(void **security);
 void security_tun_dev_free_security(void *security);
 int security_tun_dev_create(void);
 int security_tun_dev_attach_queue(void *security);
-int security_tun_dev_attach(struct sock *sk, void *security);
+int security_tun_dev_attach(struct sock *sk);
 int security_tun_dev_open(void *security);
 
 void security_skb_owned_by(struct sk_buff *skb, struct sock *sk);
@@ -2835,7 +2835,7 @@ static inline int security_tun_dev_attach_queue(void *security)
 	return 0;
 }
 
-static inline int security_tun_dev_attach(struct sock *sk, void *security)
+static inline int security_tun_dev_attach(struct sock *sk)
 {
 	return 0;
 }

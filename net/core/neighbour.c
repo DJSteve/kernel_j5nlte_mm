@@ -2855,8 +2855,6 @@ static struct neigh_parms *neigh_get_dev_parms_rcu(struct net_device *dev,
 						   int family)
 {
 	switch (family) {
-	case AF_INET:
-		return __in_dev_arp_parms_get_rcu(dev);
 	case AF_INET6:
 		return __in6_dev_nd_parms_get_rcu(dev);
 	}

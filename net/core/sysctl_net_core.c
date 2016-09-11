@@ -197,26 +197,6 @@ static int flow_limit_table_len_sysctl(struct ctl_table *table, int write,
 }
 #endif /* CONFIG_NET_FLOW_LIMIT */
 
-#ifdef CONFIG_NET_SCHED
-static int set_default_qdisc(struct ctl_table *table, int write,
-			     void __user *buffer, size_t *lenp, loff_t *ppos)
-{
-	char id[IFNAMSIZ];
-	struct ctl_table tbl = {
-		.data = id,
-		.maxlen = IFNAMSIZ,
-	};
-	int ret;
-
-	qdisc_get_default(id, IFNAMSIZ);
-
-	ret = proc_dostring(&tbl, write, buffer, lenp, ppos);
-	if (write && ret == 0)
-		ret = qdisc_set_default(id);
-	return ret;
-}
-#endif
-
 static struct ctl_table net_core_table[] = {
 #ifdef CONFIG_NET
 	{
@@ -338,14 +318,6 @@ static struct ctl_table net_core_table[] = {
 		.maxlen		= sizeof(unsigned int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec
-	},
-#endif
-#ifdef CONFIG_NET_SCHED
-	{
-		.procname	= "default_qdisc",
-		.mode		= 0644,
-		.maxlen		= IFNAMSIZ,
-		.proc_handler	= set_default_qdisc
 	},
 #endif
 #endif /* CONFIG_NET */
