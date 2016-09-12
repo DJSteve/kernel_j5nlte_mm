@@ -3293,18 +3293,12 @@ static void tcp_send_challenge_ack(struct sock *sk)
 	static u32 challenge_timestamp;
 	static unsigned int challenge_count;
 	u32 now = jiffies / HZ;
-	u32 count;
 
 	if (now != challenge_timestamp) {
-		u32 half = (sysctl_tcp_challenge_ack_limit + 1) >> 1;
-
 		challenge_timestamp = now;
-		ACCESS_ONCE(challenge_count) = half +
-				  prandom_u32_max(sysctl_tcp_challenge_ack_limit);
+		challenge_count = 0;
 	}
-	count = ACCESS_ONCE(challenge_count);
-	if (count > 0) {
-		ACCESS_ONCE(challenge_count) = count - 1;
+        if (++challenge_count <= sysctl_tcp_challenge_ack_limit) {
 		NET_INC_STATS_BH(sock_net(sk), LINUX_MIB_TCPCHALLENGEACK);
 		tcp_send_ack(sk);
 	}
@@ -3839,9 +3833,7 @@ static void tcp_fin(struct sock *sk)
 	case TCP_ESTABLISHED:
 		/* Move to CLOSE_WAIT */
 		tcp_set_state(sk, TCP_CLOSE_WAIT);
-		dst = __sk_dst_get(sk);
-		if (!dst || !dst_metric(dst, RTAX_QUICKACK))
-			inet_csk(sk)->icsk_ack.pingpong = 1;
+		inet_csk(sk)->icsk_ack.pingpong = 1;
 		break;
 
 	case TCP_CLOSE_WAIT:

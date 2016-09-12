@@ -640,39 +640,19 @@ static bool tcp_should_autocork(struct sock *sk, struct sk_buff *skb,
 	       atomic_read(&sk->sk_wmem_alloc) > skb->truesize;
 }
 
-static void tcp_push(struct sock *sk, int flags, int mss_now,
-		     int nonagle, int size_goal)
+static inline void tcp_push(struct sock *sk, int flags, int mss_now,
+			    int nonagle)
 {
-	struct tcp_sock *tp = tcp_sk(sk);
-	struct sk_buff *skb;
+	if (tcp_send_head(sk)) {
+		struct tcp_sock *tp = tcp_sk(sk);
 
-	if (!tcp_send_head(sk))
-		return;
+		if (!(flags & MSG_MORE) || forced_push(tp))
+			tcp_mark_push(tp, tcp_write_queue_tail(sk));
 
-	skb = tcp_write_queue_tail(sk);
-	if (!(flags & MSG_MORE) || forced_push(tp))
-		tcp_mark_push(tp, skb);
-
-	tcp_mark_urg(tp, flags);
-
-	if (tcp_should_autocork(sk, skb, size_goal)) {
-
-		/* avoid atomic op if TSQ_THROTTLED bit is already set */
-		if (!test_bit(TSQ_THROTTLED, &tp->tsq_flags)) {
-			NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPAUTOCORKING);
-			set_bit(TSQ_THROTTLED, &tp->tsq_flags);
-		}
-		/* It is possible TX completion already happened
-		 * before we set TSQ_THROTTLED.
-		 */
-		if (atomic_read(&sk->sk_wmem_alloc) > skb->truesize)
-			return;
+		tcp_mark_urg(tp, flags);
+		__tcp_push_pending_frames(sk, mss_now,
+					  (flags & MSG_MORE) ? TCP_NAGLE_CORK : nonagle);
 	}
-
-	if (flags & MSG_MORE)
-		nonagle = TCP_NAGLE_CORK;
-
-	__tcp_push_pending_frames(sk, mss_now, nonagle);
 }
 
 static int tcp_splice_data_recv(read_descriptor_t *rd_desc, struct sk_buff *skb,
@@ -976,7 +956,7 @@ wait_for_sndbuf:
 		set_bit(SOCK_NOSPACE, &sk->sk_socket->flags);
 wait_for_memory:
 		tcp_push(sk, flags & ~MSG_MORE, mss_now,
-			 TCP_NAGLE_PUSH, size_goal);
+			 TCP_NAGLE_PUSH);
 
 		if ((err = sk_stream_wait_memory(sk, &timeo)) != 0)
 			goto do_error;
@@ -986,7 +966,7 @@ wait_for_memory:
 
 out:
 	if (copied && !(flags & MSG_SENDPAGE_NOTLAST))
-		tcp_push(sk, flags, mss_now, tp->nonagle, size_goal);
+		tcp_push(sk, flags, mss_now, tp->nonagle);
 	return copied;
 
 do_error:
@@ -1270,7 +1250,7 @@ wait_for_sndbuf:
 wait_for_memory:
 			if (copied)
 				tcp_push(sk, flags & ~MSG_MORE, mss_now,
-					 TCP_NAGLE_PUSH, size_goal);
+					 TCP_NAGLE_PUSH);
 
 			if ((err = sk_stream_wait_memory(sk, &timeo)) != 0)
 				goto do_error;
@@ -1281,7 +1261,7 @@ wait_for_memory:
 
 out:
 	if (copied)
-		tcp_push(sk, flags, mss_now, tp->nonagle, size_goal);
+		tcp_push(sk, flags, mss_now, tp->nonagle);
 out_nopush:
 	release_sock(sk);
 	return copied + copied_syn;
@@ -2698,10 +2678,6 @@ static int do_tcp_setsockopt(struct sock *sk, int level,
 		else
 			tp->tsoffset = val - tcp_time_stamp;
 		break;
-	case TCP_NOTSENT_LOWAT:
-		tp->notsent_lowat = val;
-		sk->sk_write_space(sk);
-		break;
 	default:
 		err = -ENOPROTOOPT;
 		break;
@@ -2917,9 +2893,6 @@ static int do_tcp_getsockopt(struct sock *sk, int level,
 		break;
 	case TCP_TIMESTAMP:
 		val = tcp_time_stamp + tp->tsoffset;
-		break;
-	case TCP_NOTSENT_LOWAT:
-		val = tp->notsent_lowat;
 		break;
 	default:
 		return -ENOPROTOOPT;
