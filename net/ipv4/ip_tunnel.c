@@ -889,7 +889,7 @@ int ip_tunnel_init_net(struct net *net, int ip_tnl_net_id,
 	}
 	rtnl_unlock();
 
-	return PTR_ERR_OR_ZERO(itn->fb_tunnel_dev);
+	return PTR_ERR(itn->fb_tunnel_dev);
 }
 EXPORT_SYMBOL_GPL(ip_tunnel_init_net);
 

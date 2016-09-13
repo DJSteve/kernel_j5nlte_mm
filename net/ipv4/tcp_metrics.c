@@ -775,16 +775,10 @@ static int tcp_metrics_fill_info(struct sk_buff *msg,
 		if (nla_put_be32(msg, TCP_METRICS_ATTR_ADDR_IPV4,
 				tm->tcpm_daddr.addr.a4) < 0)
 			goto nla_put_failure;
-		if (nla_put_be32(msg, TCP_METRICS_ATTR_SADDR_IPV4,
-				tm->tcpm_saddr.addr.a4) < 0)
-			goto nla_put_failure;
 		break;
 	case AF_INET6:
 		if (nla_put(msg, TCP_METRICS_ATTR_ADDR_IPV6, 16,
 			    tm->tcpm_daddr.addr.a6) < 0)
-			goto nla_put_failure;
-		if (nla_put(msg, TCP_METRICS_ATTR_SADDR_IPV6, 16,
-			    tm->tcpm_saddr.addr.a6) < 0)
 			goto nla_put_failure;
 		break;
 	default:
@@ -941,13 +935,6 @@ static int parse_nl_addr(struct genl_info *info, struct inetpeer_addr *addr,
 			       TCP_METRICS_ATTR_ADDR_IPV6);
 }
 
-static int parse_nl_saddr(struct genl_info *info, struct inetpeer_addr *addr)
-{
-	return __parse_nl_addr(info, addr, NULL, 0,
-			       TCP_METRICS_ATTR_SADDR_IPV4,
-			       TCP_METRICS_ATTR_SADDR_IPV6);
-}
-
 static int tcp_metrics_nl_cmd_get(struct sk_buff *skb, struct genl_info *info)
 {
 	struct tcp_metrics_block *tm;
@@ -962,10 +949,6 @@ static int tcp_metrics_nl_cmd_get(struct sk_buff *skb, struct genl_info *info)
 	ret = parse_nl_addr(info, &daddr, &hash, 0);
 	if (ret < 0)
 		return ret;
-
-	ret = parse_nl_saddr(info, &saddr);
-	if (ret < 0)
-		src = false;
 
 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
 	if (!msg)
@@ -1048,9 +1031,6 @@ static int tcp_metrics_nl_cmd_del(struct sk_buff *skb, struct genl_info *info)
 		return ret;
 	if (ret > 0)
 		return tcp_metrics_flush_all(net);
-	ret = parse_nl_saddr(info, &saddr);
-	if (ret < 0)
-		src = false;
 
 	hash = hash_32(hash, net->ipv4.tcp_metrics_hash_log);
 	hb = net->ipv4.tcp_metrics_hash + hash;
@@ -1163,7 +1143,8 @@ void __init tcp_metrics_init(void)
 	if (ret < 0)
 		goto cleanup;
 	ret = genl_register_family_with_ops(&tcp_metrics_nl_family,
-					    tcp_metrics_nl_ops);
+					    tcp_metrics_nl_ops,
+                                            ARRAY_SIZE(tcp_metrics_nl_ops));
 	if (ret < 0)
 		goto cleanup_subsys;
 	return;
