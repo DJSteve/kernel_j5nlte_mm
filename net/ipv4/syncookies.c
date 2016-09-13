@@ -36,11 +36,8 @@ static DEFINE_PER_CPU(__u32 [16 + 5 + SHA_WORKSPACE_WORDS],
 static u32 cookie_hash(__be32 saddr, __be32 daddr, __be16 sport, __be16 dport,
 		       u32 count, int c)
 {
-	__u32 *tmp;
+	__u32 *tmp = __get_cpu_var(ipv4_cookie_scratch);
 
-	net_get_random_once(syncookie_secret, sizeof(syncookie_secret));
-
-	tmp  = __get_cpu_var(ipv4_cookie_scratch);
 	memcpy(tmp + 4, syncookie_secret[c], sizeof(syncookie_secret[c]));
 	tmp[0] = (__force u32)saddr;
 	tmp[1] = (__force u32)daddr;

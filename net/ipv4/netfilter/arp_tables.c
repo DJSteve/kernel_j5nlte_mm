@@ -580,14 +580,6 @@ static inline int check_entry_size_and_hooks(struct arpt_entry *e,
 		return -EINVAL;
 	}
 
-	if (!arp_checkentry(&e->arp))
-		return -EINVAL;
-
-	err = xt_check_entry_offsets(e, e->elems, e->target_offset,
-				     e->next_offset);
-	if (err)
-		return err;
-
 	/* Check hooks & underflows */
 	for (h = 0; h < NF_ARP_NUMHOOKS; h++) {
 		if (!(valid_hooks & (1 << h)))
@@ -1125,18 +1117,56 @@ static int do_add_counters(struct net *net, const void __user *user,
 	unsigned int i, curcpu;
 	struct xt_counters_info tmp;
 	struct xt_counters *paddc;
+	unsigned int num_counters;
+	const char *name;
+	int size;
+	void *ptmp;
 	struct xt_table *t;
 	const struct xt_table_info *private;
 	int ret = 0;
 	void *loc_cpu_entry;
 	struct arpt_entry *iter;
 	unsigned int addend;
+#ifdef CONFIG_COMPAT
+	struct compat_xt_counters_info compat_tmp;
 
-	paddc = xt_copy_counters_from_user(user, len, &tmp, compat);
-	if (IS_ERR(paddc))
-		return PTR_ERR(paddc);
+	if (compat) {
+		ptmp = &compat_tmp;
+		size = sizeof(struct compat_xt_counters_info);
+	} else
+#endif
+	{
+		ptmp = &tmp;
+		size = sizeof(struct xt_counters_info);
+	}
 
-	t = xt_find_table_lock(net, NFPROTO_ARP, tmp.name);
+	if (copy_from_user(ptmp, user, size) != 0)
+		return -EFAULT;
+
+#ifdef CONFIG_COMPAT
+	if (compat) {
+		num_counters = compat_tmp.num_counters;
+		name = compat_tmp.name;
+	} else
+#endif
+	{
+		num_counters = tmp.num_counters;
+		name = tmp.name;
+	}
+
+	if (len != size + num_counters * sizeof(struct xt_counters))
+		return -EINVAL;
+
+	paddc = vmalloc(len - size);
+	if (!paddc)
+		return -ENOMEM;
+
+	if (copy_from_user(paddc, user + size, len - size) != 0) {
+		ret = -EFAULT;
+		goto free;
+	}
+
+	t = xt_find_table_lock(net, NFPROTO_ARP, name);
 	if (IS_ERR_OR_NULL(t)) {
 		ret = t ? PTR_ERR(t) : -ENOENT;
 		goto free;
@@ -1144,7 +1174,7 @@ static int do_add_counters(struct net *net, const void __user *user,
 
 	local_bh_disable();
 	private = t->private;
-	if (private->number != tmp.num_counters) {
+	if (private->number != num_counters) {
 		ret = -EINVAL;
 		goto unlock_up_free;
 	}
@@ -1170,17 +1200,6 @@ static int do_add_counters(struct net *net, const void __user *user,
 }
 
 #ifdef CONFIG_COMPAT
-struct compat_arpt_replace {
-	char				name[XT_TABLE_MAXNAMELEN];
-	u32				valid_hooks;
-	u32				num_entries;
-	u32				size;
-	u32				hook_entry[NF_ARP_NUMHOOKS];
-	u32				underflow[NF_ARP_NUMHOOKS];
-	u32				num_counters;
-	compat_uptr_t			counters;
-	struct compat_arpt_entry	entries[0];
-};
 
 static inline void compat_release_entry(struct compat_arpt_entry *e)
 {
