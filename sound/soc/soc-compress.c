@@ -753,7 +753,7 @@ static struct snd_compr_ops soc_compr_ops = {
 	.free			= soc_compr_free,
 	.set_params		= soc_compr_set_params,
 	.set_metadata		= sst_compr_set_metadata,
-	.set_next_track_param	= sst_compr_set_next_track_param,
+
 	.get_metadata		= sst_compr_get_metadata,
 	.get_params		= soc_compr_get_params,
 	.trigger		= soc_compr_trigger,

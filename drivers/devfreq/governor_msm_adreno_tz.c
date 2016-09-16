@@ -27,8 +27,6 @@
 
 static bool power_suspended;
 
-extern bool mdss_screen_on;
-
 static DEFINE_SPINLOCK(tz_lock);
 
 /*
@@ -131,7 +129,7 @@ static int tz_init(struct devfreq_msm_adreno_tz_data *priv,
 		memcpy(tz_buf, tz_pwrlevels, size_pwrlevels);
 		/* Ensure memcpy completes execution */
 		mb();
-		dmac_flush_range((void*)tz_buf, (void*)tz_buf + PAGE_ALIGN(size_pwrlevels));
+		dmac_flush_range(tz_buf, tz_buf + PAGE_ALIGN(size_pwrlevels));
 
 		desc.args[0] = virt_to_phys(tz_buf);
 		desc.args[1] = size_pwrlevels;
@@ -182,7 +180,7 @@ static int tz_get_target_freq(struct devfreq *devfreq, unsigned long *freq,
 	 * Force to use & record as min freq when system has
 	 * entered pm-suspend or screen-off state.
 	 */
-	if (!mdss_screen_on) {
+	if (suspended || power_suspended) {
 		*freq = devfreq->profile->freq_table[devfreq->profile->max_state - 1];
 		return 0;
 	}

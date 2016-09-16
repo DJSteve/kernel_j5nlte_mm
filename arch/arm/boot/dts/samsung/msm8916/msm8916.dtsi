@@ -812,7 +812,7 @@
 
 	qcom_seecom: qseecom@86000000 {
 		compatible = "qcom,qseecom";
-		reg = <0x85500000 0x800000>;
+		reg = <0x85A00000 0x500000>;
 		reg-names = "secapp-region";
 		qcom,disk-encrypt-pipe-pair = <2>;
 		qcom,hlos-ce-hw-instance = <0>;
